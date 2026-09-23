@@ -6,3 +6,7 @@ matplotlib
 jupyterlab
 pytest
 python-stdnum
+jupyter-ai
+pyodbc
+azure-identity
+sqlalchemy

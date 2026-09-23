@@ -6,6 +6,21 @@ MIN_ROWS_FOR_IDENTIFIER = 20    # below this many rows, the ratio above is too n
 LOW_CARDINALITY_MAX = 15        # cardinality at or below this -> report full value counts
 TOP_N = 10                      # otherwise -> top N values + an "other" bucket
 
+# Tokens these government data tables use in place of a number when a value
+# is suppressed (e.g. small-number disclosure control) or intentionally not
+# published. A non-numeric value is only ever treated as a placeholder, not
+# genuine categorical data, when it exactly matches one of these -- anything
+# else (e.g. an age band like "45 and over") is left as a real category.
+SPECIAL_VALUE_TOKENS = {"not included", "z", ":", "*", "c", "n/a", "-", "low"}
+
+
+def _numeric_or_none(value: str):
+    """Parse a stripped string as a float, or return None if it isn't one."""
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
 
 def _summarize_column(series: pd.Series, row_count: int, top_n: int = TOP_N) -> dict:
     """Type-appropriate coarse summary for one column.
@@ -19,6 +34,15 @@ def _summarize_column(series: pd.Series, row_count: int, top_n: int = TOP_N) -> 
     of those checks (i.e. genuinely many distinct, non-identifier values).
 
     - datetime -> min/max/span
+    - numeric_w_placeholders (object dtype, at least one genuinely numeric
+      value, and every non-numeric value is a known placeholder like "not
+      included" or "z" -- see SPECIAL_VALUE_TOKENS) -> distribution stats over
+      the parseable values plus a breakdown of the placeholder rows. Checked
+      before the identifier/categorical rules below so these columns (read as
+      object dtype by pandas because of the placeholder text) get treated as
+      the numeric measures they are rather than as identifiers or categories.
+      A column with unrecognized non-numeric values (e.g. an age band like
+      "45 and over") does NOT match this and falls through to those rules.
     - near-unique (cardinality/row_count >= UNIQUE_RATIO_THRESHOLD, and enough
       rows to trust that ratio) -> identifier: how many values repeat, and how
       many rows that involves. Applies regardless of numeric/string dtype.
@@ -40,6 +64,31 @@ def _summarize_column(series: pd.Series, row_count: int, top_n: int = TOP_N) -> 
             "max": non_null.max(),
             "span_days": (non_null.max() - non_null.min()).days,
         }
+
+    if not pd.api.types.is_numeric_dtype(series) and not non_null.empty:
+        stripped = non_null.astype(str).str.strip()
+        parsed = stripped.map(_numeric_or_none)
+        is_special_token = stripped.str.lower().isin(SPECIAL_VALUE_TOKENS)
+        unparsed = parsed.isna()
+        # Every non-numeric value must be a recognized placeholder, and there
+        # must be at least one real number -- otherwise this is either a
+        # genuine category column or entirely non-numeric text.
+        if parsed.notna().any() and (unparsed == is_special_token).all():
+            numeric_values = parsed.dropna()
+            special_counts = stripped[unparsed].value_counts().to_dict()
+            desc = numeric_values.describe()
+            return {
+                "kind": "numeric_w_placeholders",
+                "min": round(desc["min"], 2),
+                "p25": round(desc["25%"], 2),
+                "median": round(desc["50%"], 2),
+                "p75": round(desc["75%"], 2),
+                "max": round(desc["max"], 2),
+                "mean": round(desc["mean"], 2),
+                "std": round(desc["std"], 2),
+                "special_rows": int(unparsed.sum()),
+                "special_values": special_counts,
+            }
 
     # Float columns are excluded here: continuous measurements (lab values,
     # prices) are naturally almost-always-unique, which isn't the same thing
@@ -95,8 +144,14 @@ def profile_dataframe(df: pd.DataFrame, sample_size: int = 5) -> dict:
       - shape: (n_rows, n_cols)
       - duplicate_rows: count of fully duplicated rows
       - columns: a DataFrame indexed by column name with dtype, null_pct,
-        cardinality (nunique), a sample of distinct values, and a
-        type-appropriate coarse summary (see _summarize_column).
+        valid_pct (rows that are neither null nor a placeholder token -- i.e.
+        actually usable as the column's real datatype; equals 100 - null_pct
+        except on numeric_w_placeholders columns, where placeholder rows are
+        also subtracted), cardinality (nunique), a sample of distinct values,
+        a type-appropriate coarse summary (see _summarize_column), and
+        special_values -- the placeholder-token breakdown for
+        numeric_w_placeholders columns (pulled out of summary for
+        visibility), None for every other column.
     """
     n_rows, n_cols = df.shape
     duplicate_rows = int(df.duplicated().sum())
@@ -104,17 +159,24 @@ def profile_dataframe(df: pd.DataFrame, sample_size: int = 5) -> dict:
     rows = []
     for col in df.columns:
         series = df[col]
-        null_pct = round(series.isna().mean() * 100, 2)
+        null_count = int(series.isna().sum())
+        null_pct = round(null_count / n_rows * 100, 2) if n_rows else None
         cardinality = int(series.nunique(dropna=True))
         samples = series.dropna().unique()[:sample_size]
+        summary = _summarize_column(series, n_rows)
+        is_placeholder_col = summary["kind"] == "numeric_w_placeholders"
+        special_rows = summary["special_rows"] if is_placeholder_col else 0
+        valid_pct = round((n_rows - null_count - special_rows) / n_rows * 100, 2) if n_rows else None
         rows.append(
             {
                 "column": col,
                 "dtype": str(series.dtype),
                 "null_pct": null_pct,
+                "valid_pct": valid_pct,
                 "cardinality": cardinality,
                 "sample_values": list(samples),
-                "summary": _summarize_column(series, n_rows),
+                "summary": summary,
+                "special_values": summary.get("special_values") if is_placeholder_col else None,
             }
         )
 
@@ -141,7 +203,13 @@ def inspect_column(df: pd.DataFrame, column: str, top_n: int = TOP_N, bins: int 
     series = df[column].dropna()
     kind = _summarize_column(series, len(df), top_n=top_n)["kind"]
 
-    if kind in ("numeric", "datetime"):
+    if kind == "numeric_w_placeholders":
+        numeric_series = series.astype(str).str.strip().map(_numeric_or_none).dropna()
+        numeric_series.hist(bins=bins)
+        plt.title(f"{column} distribution (excludes placeholder rows)")
+        plt.xlabel(column)
+        plt.ylabel("count")
+    elif kind in ("numeric", "datetime"):
         series.hist(bins=bins)
         plt.title(f"{column} distribution")
         plt.xlabel(column)
